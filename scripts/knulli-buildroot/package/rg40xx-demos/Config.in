@@ -1,0 +1,64 @@
+# Knulli OS Buildroot integration for RG40XX H demos
+# Place these in the Knulli buildroot external tree to compile demos
+
+# This directory structure should be added to your Knulli buildroot external tree:
+# external-tree/package/rg40xx-demos/
+
+# File: Config.in
+config BR2_PACKAGE_RG40XX_DEMOS
+    bool "rg40xx-demos"
+    depends on BR2_PACKAGE_SDL2
+    depends on BR2_PACKAGE_HAS_LIBOPENGL_EGL
+    help
+      Native demos for Anbernic RG40XX H (Knulli OS)
+      
+      Includes:
+        - SDL2 demos (bouncing-balls, particles, starfield)
+        - Raylib demos (snake, shooter, platformer, pong, raycaster)
+        - Game ports (TyrQuake, Chocolate Doom, NXEngine)
+      
+      https://github.com/Miolonixc/rg40xx-demos
+
+# File: rg40xx-demos.mk
+RGG40XX_DEMOS_VERSION = main
+RG40XX_DEMOS_SITE = https://github.com/Miolonixc/rg40xx-demos.git
+RG40XX_DEMOS_SITE_METHOD = git
+RG40XX_DEMOS_LICENSE = MIT
+RG40XX_DEMOS_LICENSE_FILES = LICENSE
+
+RG40XX_DEMOS_DEPENDENCIES = sdl2
+
+ifeq ($(BR2_PACKAGE_RAYLIB),y)
+RG40XX_DEMOS_DEPENDENCIES += raylib
+RG40XX_DEMOS_CONF_OPTS += -DRAYLIB_DEMOS=ON
+else
+RG40XX_DEMOS_CONF_OPTS += -DRAYLIB_DEMOS=OFF
+endif
+
+define RG40XX_DEMOS_BUILD_CMDS
+    $(TARGET_CC) $(TARGET_CFLAGS) $(TARGET_LDFLAGS) \
+        -I$(STAGING_DIR)/usr/include/SDL2 \
+        -o $(@D)/bouncing-balls \
+        $(@D)/sdl-demos/bouncing-balls.c \
+        -lSDL2 -lm
+    
+    $(TARGET_CC) $(TARGET_CFLAGS) $(TARGET_LDFLAGS) \
+        -I$(STAGING_DIR)/usr/include/SDL2 \
+        -o $(@D)/particles \
+        $(@D)/sdl-demos/particles.c \
+        -lSDL2 -lm
+    
+    $(TARGET_CC) $(TARGET_CFLAGS) $(TARGET_LDFLAGS) \
+        -I$(STAGING_DIR)/usr/include/SDL2 \
+        -o $(@D)/starfield \
+        $(@D)/sdl-demos/starfield.c \
+        -lSDL2 -lm
+endef
+
+define RG40XX_DEMOS_INSTALL_TARGET_CMDS
+    $(INSTALL) -D -m 0755 $(@D)/bouncing-balls $(TARGET_DIR)/usr/bin/rg40xx-bouncing-balls
+    $(INSTALL) -D -m 0755 $(@D)/particles $(TARGET_DIR)/usr/bin/rg40xx-particles
+    $(INSTALL) -D -m 0755 $(@D)/starfield $(TARGET_DIR)/usr/bin/rg40xx-starfield
+endef
+
+$(eval $(generic-package))

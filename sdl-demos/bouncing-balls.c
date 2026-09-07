@@ -1,5 +1,4 @@
 #include <SDL2/SDL.h>
-#include <SDL2/SDL2_gfxPrimitives.h>
 #include <math.h>
 #include <stdlib.h>
 #include <time.h>
@@ -10,7 +9,7 @@
 
 typedef struct {
     float x, y, vx, vy, r;
-    Uint32 color;
+    Uint8 r8, g8, b8;
 } Ball;
 
 int main(int argc, char *argv[]) {
@@ -18,10 +17,7 @@ int main(int argc, char *argv[]) {
     SDL_Window *win = SDL_CreateWindow("Bouncing Balls", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, W, H, SDL_WINDOW_FULLSCREEN);
     SDL_Renderer *ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     
-    SDL_GameController *ctrl = NULL;
-    if (SDL_NumJoysticks() > 0) {
-        SDL_GameControllerOpen(0);
-    }
+    if (SDL_NumJoysticks() > 0) SDL_GameControllerOpen(0);
 
     Ball balls[BALLS];
     srand(time(NULL));
@@ -31,7 +27,9 @@ int main(int argc, char *argv[]) {
         balls[i].vx = (rand() % 200 - 100) / 50.0f;
         balls[i].vy = (rand() % 200 - 100) / 50.0f;
         balls[i].r = rand() % 15 + 8;
-        balls[i].color = rand() | 0xFF000000;
+        balls[i].r8 = rand() % 255;
+        balls[i].g8 = rand() % 255;
+        balls[i].b8 = rand() % 255;
     }
 
     int running = 1;
@@ -43,7 +41,6 @@ int main(int argc, char *argv[]) {
             if (e.type == SDL_CONTROLLERBUTTONDOWN && e.cbutton.button == SDL_CONTROLLER_BUTTON_START) running = 0;
         }
 
-        // Update
         for (int i = 0; i < BALLS; i++) {
             balls[i].x += balls[i].vx;
             balls[i].y += balls[i].vy;
@@ -53,11 +50,16 @@ int main(int argc, char *argv[]) {
             balls[i].y = fmax(balls[i].r, fmin(H - balls[i].r, balls[i].y));
         }
 
-        // Render
         SDL_SetRenderDrawColor(ren, 20, 20, 30, 255);
         SDL_RenderClear(ren);
         for (int i = 0; i < BALLS; i++) {
-            filledCircleColor(ren, balls[i].x, balls[i].y, balls[i].r, balls[i].color);
+            SDL_SetRenderDrawColor(ren, balls[i].r8, balls[i].g8, balls[i].b8, 255);
+            // Simple circle fill
+            for (int dy = -balls[i].r; dy <= balls[i].r; dy++) {
+                int dx = (int)sqrt(balls[i].r * balls[i].r - dy * dy);
+                SDL_Rect rect = { (int)balls[i].x - dx, (int)balls[i].y + dy, dx * 2, 1 };
+                SDL_RenderFillRect(ren, &rect);
+            }
         }
         SDL_RenderPresent(ren);
     }

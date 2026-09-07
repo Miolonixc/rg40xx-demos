@@ -1,40 +1,66 @@
-# RG40XX H Demos
+# RG40XX H Demos (Knulli OS Edition)
 
-Нативные демки и порты для Anbernic RG40XX H (Linux ARM, H700, 1GB RAM).
+Нативные демки и порты для Anbernic RG40XX H под **Knulli OS 2.173** (Buildroot-based).
+
+## Важно про Knulli OS
+
+Knulli OS — минималистичный Linux на базе Buildroot. Особенности:
+- **Нет gcc/make из коробки** — только рантайм-библиотеки
+- **Нет apt/dnf** — пакеты через `opkg` (если настроен) или только кросс-компиляция
+- **Есть SDL2** — используется для эмуляторов (RetroArch)
+- **Нет raylib** — нужно компилировать статически
+- **Mali G31** — OpenGL ES 3.0 доступен через libMali
+
+## Варианты запуска
+
+### 1. Кросс-компиляция на хосте (рекомендуется)
+
+```bash
+# На x86_64 хосте с установленным arm-linux-gnueabihf toolchain
+make CROSS=arm-linux-gnueabihf- PLATFORM=PLATFORM_ANDROID
+```
+
+### 2. Статическая сборка raylib
+
+Raylib можно собрать статически и прилинковать к демке — тогда на устройстве не нужны .so файлы.
+
+### 3. Нативная сборка (если есть SDK от Knulli)
+
+Если Knulli предоставляет SDK — можно собирать на устройстве.
 
 ## Структура
 
 ```
 rg40xx-demos/
-├── sdl-demos/        # SDL2 демки (C)
-├── raylib-demos/     # Raylib демки (C)
-├── quake/            # Quake 1 порт (TyrQuake)
-├── doom/             # Doom порт (Chocolate Doom)
-├── cave-story/       # Cave Story (NXEngine)
-├── supertux/         # SuperTux порт
-└── scripts/          # Скрипты сборки и установки
+├── sdl-demos/        # SDL2 демки (работают из коробки на Knulli)
+├── raylib-demos/     # Raylib демки (нужна статическая линковка)
+├── quake/            # TyrQuake
+├── doom/             # Chocolate Doom
+├── cave-story/       # NXEngine
+└── scripts/          # Скрипты сборки
 ```
 
-## Быстрый старт
+## Быстрый старт на Knulli OS
 
 ```bash
-# Клонировать на RG40XX H (или кросс-компилировать)
-git clone https://github.com/Miolonixc/rg40xx-demos.git
-cd rg40xx-demos
+# 1. Подключиться по SSH к RG40XX H
+ssh root@<ip-rg40xx>
 
-# Собрать SDL2 демку
-./scripts/build-sdl-demos.sh
+# 2. Скачать демки
+cd /tmp
+wget https://github.com/Miolonixc/rg40xx-demos/releases/latest/download/rg40xx-sdl-demos.tar.gz
+tar xzf rg40xx-sdl-demos.tar.gz
 
-# Установить Quake
-./scripts/install-quake.sh
+# 3. Запустить SDL2 демку (работает без установки!)
+./bouncing-balls
 ```
 
 ## Целевые платформы
 
-- **CPU**: H700 quad-core ARM Cortex-A53 @ 1.5GHz
-- **GPU**: Mali G31 MP2
+- **CPU**: Allwinner H700 quad-core ARM Cortex-A53 @ 1.5GHz
+- **GPU**: Mali G31 MP2 (OpenGL ES 3.0)
 - **RAM**: 1GB LPDDR4
-- **OS**: Linux 64-bit (32-bit userland)
+- **OS**: Knulli OS 2.173 (Buildroot, kernel 4.9.170)
 - **Экран**: 4" IPS 640x480
 - **Ввод**: GPIO-кнопки, аналоговые стики
 

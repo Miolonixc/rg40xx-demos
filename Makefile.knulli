@@ -1,0 +1,108 @@
+# Cross-compilation Makefile for Knulli OS
+# 
+# Usage:
+#   1. Download Knulli SDK toolchain (or extract from buildroot)
+#   2. Set CROSS_COMPILE to the toolchain prefix
+#   3. Run: make -f Makefile.knulli
+#
+# Knulli uses: arm-linux-gnueabihf (hard float, ARMv7-A compatible)
+# The H700 is ARMv8-A (A53) but runs 32-bit userland
+
+CROSS_COMPILE ?= arm-linux-gnueabihf-
+CC = $(CROSS_COMPILE)gcc
+STRIP = $(CROSS_COMPILE)strip
+
+# SDL2 flags (from Knulli staging)
+SDL2_CFLAGS = -I$(KNULLI_STAGING)/usr/include/SDL2
+SDL2_LIBS = -lSDL2 -lm
+
+# Output
+OUTDIR = bin/knulli
+
+# Demos
+SDL_DEMOS = bouncing-balls particles starfield
+RAYLIB_DEMOS = snake shooter platformer pong raycaster matrix-rain bounce
+
+.PHONY: all clean sdl-demos raylib-demos
+
+all: sdl-demos raylib-demos
+
+sdl-demos: $(addprefix $(OUTDIR)/,$(SDL_DEMOS))
+
+raylib-demos: $(addprefix $(OUTDIR)/,$(RAYLIB_DEMOS))
+
+$(OUTDIR)/bouncing-balls: sdl-demos/bouncing-balls.c
+	@mkdir -p $(OUTDIR)
+	$(CC) -O2 $(SDL2_CFLAGS) $< -o $@ $(SDL2_LIBS)
+	$(STRIP) $@
+
+$(OUTDIR)/particles: sdl-demos/particles.c
+	@mkdir -p $(OUTDIR)
+	$(CC) -O2 $(SDL2_CFLAGS) $< -o $@ $(SDL2_LIBS)
+	$(STRIP) $@
+
+$(OUTDIR)/starfield: sdl-demos/starfield.c
+	@mkdir -p $(OUTDIR)
+	$(CC) -O2 $(SDL2_CFLAGS) $< -o $@ $(SDL2_LIBS)
+	$(STRIP) $@
+
+# Raylib demos - statically linked
+$(OUTDIR)/snake: raylib-demos/snake.c
+	@mkdir -p $(OUTDIR)
+	$(CC) -O2 -I$(KNULLI_STAGING)/usr/include $< -o $@ \
+		$(KNULLI_STAGING)/usr/lib/libraylib.a \
+		-lm -lpthread -ldl -lrt -lGLESv2 -lEGL
+	$(STRIP) $@
+
+$(OUTDIR)/shooter: raylib-demos/shooter.c
+	@mkdir -p $(OUTDIR)
+	$(CC) -O2 -I$(KNULLI_STAGING)/usr/include $< -o $@ \
+		$(KNULLI_STAGING)/usr/lib/libraylib.a \
+		-lm -lpthread -ldl -lrt -lGLESv2 -lEGL
+	$(STRIP) $@
+
+$(OUTDIR)/platformer: raylib-demos/platformer.c
+	@mkdir -p $(OUTDIR)
+	$(CC) -O2 -I$(KNULLI_STAGING)/usr/include $< -o $@ \
+		$(KNULLI_STAGING)/usr/lib/libraylib.a \
+		-lm -lpthread -ldl -lrt -lGLESv2 -lEGL
+	$(STRIP) $@
+
+$(OUTDIR)/pong: raylib-demos/pong.c
+	@mkdir -p $(OUTDIR)
+	$(CC) -O2 -I$(KNULLI_STAGING)/usr/include $< -o $@ \
+		$(KNULLI_STAGING)/usr/lib/libraylib.a \
+		-lm -lpthread -ldl -lrt -lGLESv2 -lEGL
+	$(STRIP) $@
+
+$(OUTDIR)/raycaster: raylib-demos/raycaster.c
+	@mkdir -p $(OUTDIR)
+	$(CC) -O2 -I$(KNULLI_STAGING)/usr/include $< -o $@ \
+		$(KNULLI_STAGING)/usr/lib/libraylib.a \
+		-lm -lpthread -ldl -lrt -lGLESv2 -lEGL
+	$(STRIP) $@
+
+$(OUTDIR)/matrix-rain: raylib-demos/matrix-rain.c
+	@mkdir -p $(OUTDIR)
+	$(CC) -O2 -I$(KNULLI_STAGING)/usr/include $< -o $@ \
+		$(KNULLI_STAGING)/usr/lib/libraylib.a \
+		-lm -lpthread -ldl -lrt -lGLESv2 -lEGL
+	$(STRIP) $@
+
+$(OUTDIR)/bounce: raylib-demos/bounce.c
+	@mkdir -p $(OUTDIR)
+	$(CC) -O2 -I$(KNULLI_STAGING)/usr/include $< -o $@ \
+		$(KNULLI_STAGING)/usr/lib/libraylib.a \
+		-lm -lpthread -ldl -lrt -lGLESv2 -lEGL
+	$(STRIP) $@
+
+clean:
+	rm -rf $(OUTDIR)
+
+# Package for release
+release: all
+	mkdir -p release
+	cp -r bin/knulli/* release/
+	@echo "Packaging for Knulli OS..."
+	cd release && tar czf ../rg40xx-demos-knulli.tar.gz *
+	@echo "Created: rg40xx-demos-knulli.tar.gz"
