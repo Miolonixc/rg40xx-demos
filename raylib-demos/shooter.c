@@ -1,6 +1,7 @@
 #include "raylib.h"
 #include <math.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 #define W 640
@@ -13,7 +14,7 @@
 
 typedef struct { float x, y; } Vec2;
 typedef struct { float x, y, vy; bool active; } Bullet;
-typedef struct { float x, y, vx, hp; bool active; } Enemy;
+typedef struct { float x, y, vy, hp; bool active; } Enemy;
 
 int main(void) {
     InitWindow(W, H, "Space Shooter");

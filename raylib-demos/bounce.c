@@ -68,7 +68,7 @@ int main(void) {
         }
         
         DrawCircle((int)ballX, (int)ballY, ballR, WHITE);
-        DrawCircleGradient((int)ballX, (int)ballY, ballR, YELLOW, RED);
+        DrawCircleGradient((Vector2){ballX, ballY}, ballR, YELLOW, RED);
         
         DrawText("Arrows/WASD + Gamepad", 10, 10, 20, LIGHTGRAY);
         DrawFPS(W - 80, 10);
