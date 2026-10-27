@@ -9,7 +9,7 @@
 | `battery-tools` | `/userdata/system/bin/` | Утилита: состояние и все настройки |
 | `services/chargelimit` | `/userdata/system/services/` | Держит заряд в диапазоне, пока подключена зарядка |
 | `services/lowbattery` | `/userdata/system/services/` | Выключает приставку при низком заряде на батарее |
-| `app/battery_app.py`, `app/Battery.sh` | `/userdata/roms/tools/` | Приложение «Батарея» |
+| `app/battery_app.py`, `app/Battery.sh` | `/userdata/roms/tools/` | Приложение Battery |
 
 Настройки хранятся в `/userdata/system/configs/battery-tools.conf`. Службы перечитывают файл на каждой проверке (раз в 30/60 с), поэтому изменения применяются без перезапуска.
 
@@ -19,11 +19,13 @@
 tools/battery/install.sh 192.168.2.173
 ```
 
-Установщик сохраняет существующие настройки, включает обе службы в автозапуск (`system.services` в `knulli.conf`) и добавляет «Батарею» в `gamelist.xml` раздела «Инструменты». Чтобы она появилась в меню, обновите списки игр в EmulationStation или перезагрузите приставку.
+Установщик сохраняет существующие настройки, включает обе службы в автозапуск (`system.services` в `knulli.conf`) и добавляет Battery в `gamelist.xml` раздела «Инструменты». EmulationStation держит списки в памяти и записывает их обратно при перезагрузке, поэтому установщик сначала просит её сохранить списки (`/reloadgames` на порту 1234), затем правит файл и перезагружает списки ещё раз.
 
 ## Приложение
 
-Крестовина выбирает пункт, A меняет его, влево/вправо перебирают значения, B выходит.
+Называется Battery и в списке «Инструментов», и в шапке. Интерфейс на английском; пункт **Language / Язык** переключает на русский, выбор хранится в `/userdata/system/configs/battery-app.conf`.
+
+Крестовина выбирает пункт, A меняет его, влево/вправо перебирают значения. Выход — B, Start, Menu или пункт Exit. Номера кнопок приложение берёт из `es_input.cfg` EmulationStation. Запасной вариант — `port-exit-watcher.py`: он закрывает само приложение по Menu или Select+Start. Нажатые кнопки пишутся в `/tmp/battery_app.log`.
 
 - **Ограничение заряда** — вкл/выкл.
 - **Диапазон** — 40–60% (хранение, игра на ТВ с кабелем), 50–80% (повседневно), 20–80% (максимум циклов).
@@ -53,7 +55,7 @@ battery-tools lowbat-percent 20
 ## Удаление
 
 ```sh
-ssh root@192.168.2.173 'for s in chargelimit lowbattery; do knulli-services stop $s; knulli-services disable $s; rm /userdata/system/services/$s; done; rm -r /userdata/system/bin/battery-tools /userdata/system/configs/battery-tools.conf /userdata/roms/tools/Battery.sh /userdata/roms/tools/battery /userdata/roms/tools/images/battery.png'
+ssh root@192.168.2.173 'for s in chargelimit lowbattery; do knulli-services stop $s; knulli-services disable $s; rm /userdata/system/services/$s; done; rm -r /userdata/system/bin/battery-tools /userdata/system/configs/battery-tools.conf /userdata/system/configs/battery-app.conf /userdata/roms/tools/Battery.sh /userdata/roms/tools/battery /userdata/roms/tools/images/battery.png'
 ```
 
 Запись в `gamelist.xml` раздела «Инструменты» удаляется вручную; копия до установки — `gamelist.xml.bak-battery-20261027`.

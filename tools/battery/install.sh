@@ -26,6 +26,10 @@ for service in chargelimit lowbattery; do
 done
 mkdir -p /userdata/roms/tools/images
 python3 /userdata/roms/tools/battery/battery_app.py --icon /userdata/roms/tools/images/battery.png >/dev/null 2>&1 || true
+# EmulationStation keeps gamelists in memory and writes them back when it reloads, so let it
+# save first, edit the file, then reload again to show the new entry.
+reload_es() { curl -s -m 30 http://127.0.0.1:1234/reloadgames >/dev/null 2>&1 || true; }
+reload_es
 python3 - <<"PY"
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -35,9 +39,10 @@ root = tree.getroot()
 game = next((g for g in root.findall("game") if g.findtext("path") == "./Battery.sh"), None)
 if game is None:
     game = ET.SubElement(root, "game")
-fields = (("path", "./Battery.sh"), ("name", "Батарея"),
-          ("desc", "Ограничение заряда на зарядке (40–60%, 50–80% или 20–80%), полный заряд "
-                   "один раз по запросу, выключение при низком заряде и состояние батареи."),
+fields = (("path", "./Battery.sh"), ("name", "Battery"),
+          ("desc", "Charge limit while plugged in (40-60%, 50-80% or 20-80%), a one-time full "
+                   "charge on request, low-battery shutdown and battery status. English or "
+                   "Russian, switched in the app."),
           ("image", "./images/battery.png"), ("developer", "rg40xx-demos"),
           ("genre", "System Tools"))
 changed = False
@@ -52,5 +57,6 @@ if changed:
     tree.write(path, encoding="utf-8", xml_declaration=True)
     print("Updated Battery in the Tools gamelist")
 PY
+reload_es
 /userdata/system/bin/battery-tools status'
-echo "Installed. Reload games in EmulationStation (Start > Game settings > Update gamelists) to see Battery in Tools."
+echo "Installed. Battery is in Tools (EmulationStation gamelists were reloaded)."
