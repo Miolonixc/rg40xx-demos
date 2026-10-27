@@ -1,0 +1,70 @@
+#!/bin/bash
+# Power the console off cleanly when the battery drains to LOWBAT_PERCENT (15% by default).
+# Only while discharging: on a charger nothing happens. Two low readings in a row are required
+# so a momentary dip under load does not turn the console off. Settings:
+# /userdata/system/configs/battery-tools.conf, read on every check (see battery-tools).
+BATTERY=/sys/class/power_supply/axp2202-battery
+CONF=/userdata/system/configs/battery-tools.conf
+PIDFILE=/var/run/lowbattery.pid
+LOG=/userdata/system/logs/lowbattery.log
+INTERVAL=60
+
+load_settings() {
+    LOWBAT_ENABLED=1
+    LOWBAT_PERCENT=15
+    # shellcheck source=/dev/null
+    [ -f "$CONF" ] && . "$CONF"
+}
+
+watch_battery() {
+    low=0
+    while true; do
+        load_settings
+        capacity=$(cat "$BATTERY/capacity" 2>/dev/null)
+        status=$(cat "$BATTERY/status" 2>/dev/null)
+        if [ "$LOWBAT_ENABLED" = 1 ] && [ "$status" = "Discharging" ] && [ -n "$capacity" ] &&
+            [ "$capacity" -le "$LOWBAT_PERCENT" ]; then
+            low=$((low + 1))
+        else
+            low=0
+        fi
+        if [ "$low" -ge 2 ]; then
+            echo "$(date '+%F %T') battery ${capacity}% ${status}: shutting down" >>"$LOG"
+            /usr/bin/knulli-shutdown --shutdown
+            exit 0
+        fi
+        sleep "$INTERVAL"
+    done
+}
+
+case "$1" in
+    start)
+        echo -n "Starting low battery shutdown: "
+        if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+            echo "already running"
+            exit 0
+        fi
+        watch_battery </dev/null >/dev/null 2>&1 &
+        echo $! >"$PIDFILE"
+        echo "done"
+        ;;
+    stop)
+        if [ -f "$PIDFILE" ]; then
+            kill "$(cat "$PIDFILE")" 2>/dev/null
+            rm -f "$PIDFILE"
+        fi
+        ;;
+    status)
+        load_settings
+        if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+            echo "running, $([ "$LOWBAT_ENABLED" = 1 ] && echo "threshold ${LOWBAT_PERCENT}%" || echo off)," \
+                "battery $(cat "$BATTERY/capacity")% $(cat "$BATTERY/status")"
+        else
+            echo "stopped"
+        fi
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|status}"
+        ;;
+esac
+exit 0

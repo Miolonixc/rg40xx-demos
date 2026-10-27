@@ -1,0 +1,107 @@
+#!/bin/bash
+# Keep the battery within LOW-HIGH percent (40-60 by default) while a charger is connected, to
+# slow battery wear. On the charger the console then runs from USB power without charging the
+# battery above the upper limit. Settings: /userdata/system/configs/battery-tools.conf, read on
+# every check (see battery-tools).
+#
+# The PMIC (AXP2202, mainline name AXP717) has no sysfs control for this, so the service flips
+# the charger enable bit (bit 1 of register 0x19, MODULE_EN_CONTROL_2) over I2C, the same bit
+# the mainline Linux driver uses to inhibit charging. Only that bit is changed.
+# Without a charger, with the limit off, and whenever the service stops, charging is enabled.
+BATTERY=/sys/class/power_supply/axp2202-battery
+USB=/sys/class/power_supply/axp2202-usb
+CONF=/userdata/system/configs/battery-tools.conf
+BUS=5
+CHIP=0x34
+REG=0x19
+BIT=0x02
+PIDFILE=/var/run/chargelimit.pid
+LOG=/userdata/system/logs/chargelimit.log
+INTERVAL=30
+
+load_settings() {
+    LIMIT_ENABLED=1
+    LOW=40
+    HIGH=60
+    FULL_ONCE=0
+    # shellcheck source=/dev/null
+    [ -f "$CONF" ] && . "$CONF"
+}
+
+charging_allowed() {
+    local value
+    value=$(i2cget -f -y $BUS $CHIP $REG 2>/dev/null) || return 2
+    [ $((value & BIT)) -ne 0 ]
+}
+
+set_charging() {  # on|off
+    local value new
+    value=$(i2cget -f -y $BUS $CHIP $REG 2>/dev/null) || return 1
+    if [ "$1" = on ]; then new=$((value | BIT)); else new=$((value & ~BIT)); fi
+    [ "$new" -eq $((value)) ] && return 0
+    i2cset -f -y $BUS $CHIP $REG "$(printf '0x%02x' "$new")" &&
+        echo "$(date '+%F %T') battery $(cat "$BATTERY/capacity")%: charging $1" >>"$LOG"
+}
+
+finish_full_charge() {
+    sed -i 's/^FULL_ONCE=1$/FULL_ONCE=0/' "$CONF"
+    echo "$(date '+%F %T') battery $(cat "$BATTERY/capacity")%: one-time full charge finished" >>"$LOG"
+}
+
+watch_charge() {
+    trap 'set_charging on; exit 0' TERM INT
+    while true; do
+        load_settings
+        capacity=$(cat "$BATTERY/capacity" 2>/dev/null)
+        status=$(cat "$BATTERY/status" 2>/dev/null)
+        plugged=$(cat "$USB/online" 2>/dev/null)
+        if [ "$FULL_ONCE" = 1 ] && { [ "$plugged" != 1 ] || [ "$status" = Full ] ||
+            [ "${capacity:-0}" -ge 100 ]; }; then
+            finish_full_charge
+            FULL_ONCE=0
+        fi
+        if [ "$plugged" != 1 ] || [ -z "$capacity" ] || [ "$LIMIT_ENABLED" != 1 ] ||
+            [ "$FULL_ONCE" = 1 ]; then
+            set_charging on
+        elif [ "$capacity" -ge "$HIGH" ]; then
+            set_charging off
+        elif [ "$capacity" -le "$LOW" ]; then
+            set_charging on
+        fi
+        sleep "$INTERVAL" &
+        wait $!
+    done
+}
+
+case "$1" in
+    start)
+        echo -n "Starting charge limit: "
+        if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+            echo "already running"
+            exit 0
+        fi
+        watch_charge </dev/null >/dev/null 2>&1 &
+        echo $! >"$PIDFILE"
+        echo "done"
+        ;;
+    stop)
+        if [ -f "$PIDFILE" ]; then
+            kill "$(cat "$PIDFILE")" 2>/dev/null
+            rm -f "$PIDFILE"
+        fi
+        set_charging on
+        ;;
+    status)
+        load_settings
+        state=stopped
+        [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null && state=running
+        charging_allowed && allowed=allowed || allowed=blocked
+        echo "$state, limit $([ "$LIMIT_ENABLED" = 1 ] && echo "${LOW}-${HIGH}%" || echo off)," \
+            "battery $(cat "$BATTERY/capacity")% $(cat "$BATTERY/status"), charger" \
+            "online=$(cat "$USB/online"), charging $allowed"
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|status}"
+        ;;
+esac
+exit 0

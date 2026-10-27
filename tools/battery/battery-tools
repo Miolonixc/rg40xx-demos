@@ -1,0 +1,146 @@
+#!/bin/bash
+# Battery tools for the RG40XX H on Knulli: charge limit and low-battery shutdown settings.
+# Settings live in one file read by the chargelimit and lowbattery services on every check,
+# so changes apply within half a minute without restarting anything.
+#
+#   battery-tools status              human-readable state
+#   battery-tools status --raw        key=value lines for the Battery app
+#   battery-tools limit on|off|toggle charge limit while on the charger
+#   battery-tools range LOW HIGH      limit range, e.g. 40 60
+#   battery-tools full                allow one charge to 100%, then the limit returns
+#   battery-tools lowbat on|off|toggle shutdown at low battery
+#   battery-tools lowbat-percent N    shutdown threshold, 5-30%
+set -u
+CONF=/userdata/system/configs/battery-tools.conf
+BATTERY=/sys/class/power_supply/axp2202-battery
+USB=/sys/class/power_supply/axp2202-usb
+
+LIMIT_ENABLED=1
+LOW=40
+HIGH=60
+FULL_ONCE=0
+LOWBAT_ENABLED=1
+LOWBAT_PERCENT=15
+# shellcheck source=/dev/null
+[ -f "$CONF" ] && . "$CONF"
+
+save() {
+    mkdir -p "$(dirname "$CONF")"
+    cat >"$CONF.tmp" <<EOF
+LIMIT_ENABLED=$LIMIT_ENABLED
+LOW=$LOW
+HIGH=$HIGH
+FULL_ONCE=$FULL_ONCE
+LOWBAT_ENABLED=$LOWBAT_ENABLED
+LOWBAT_PERCENT=$LOWBAT_PERCENT
+EOF
+    mv "$CONF.tmp" "$CONF"
+}
+
+switch() {  # current value, argument -> new value
+    case "$2" in
+        on) echo 1 ;;
+        off) echo 0 ;;
+        toggle) [ "$1" = 1 ] && echo 0 || echo 1 ;;
+        *) echo "Expected on, off or toggle" >&2; exit 2 ;;
+    esac
+}
+
+read_sys() {
+    cat "$1" 2>/dev/null || echo "?"
+}
+
+charging_allowed() {
+    local value
+    value=$(i2cget -f -y 5 0x34 0x19 2>/dev/null) || { echo "?"; return; }
+    [ $((value & 0x02)) -ne 0 ] && echo 1 || echo 0
+}
+
+service_running() {
+    local pid
+    pid=$(cat "/var/run/$1.pid" 2>/dev/null) && kill -0 "$pid" 2>/dev/null && echo 1 || echo 0
+}
+
+case "${1:-status}" in
+    status)
+        capacity=$(read_sys "$BATTERY/capacity")
+        status=$(read_sys "$BATTERY/status")
+        online=$(read_sys "$USB/online")
+        voltage=$(read_sys "$BATTERY/voltage_now")
+        temp=$(read_sys "$BATTERY/temp")
+        health=$(read_sys "$BATTERY/health")
+        empty=$(read_sys "$BATTERY/time_to_empty_now")
+        full=$(read_sys "$BATTERY/time_to_full_now")
+        allowed=$(charging_allowed)
+        if [ "${2:-}" = --raw ]; then
+            echo "capacity=$capacity"
+            echo "status=$status"
+            echo "charger=$online"
+            echo "voltage_uv=$voltage"
+            echo "temp_decic=$temp"
+            echo "health=$health"
+            echo "time_to_empty_s=$empty"
+            echo "time_to_full_s=$full"
+            echo "charging_allowed=$allowed"
+            echo "limit_enabled=$LIMIT_ENABLED"
+            echo "low=$LOW"
+            echo "high=$HIGH"
+            echo "full_once=$FULL_ONCE"
+            echo "lowbat_enabled=$LOWBAT_ENABLED"
+            echo "lowbat_percent=$LOWBAT_PERCENT"
+            echo "chargelimit_service=$(service_running chargelimit)"
+            echo "lowbattery_service=$(service_running lowbattery)"
+        else
+            echo "Батарея: $capacity% ($status), зарядка подключена: $([ "$online" = 1 ] && echo да || echo нет)"
+            echo "Напряжение: $voltage мкВ, температура: $temp (десятые °C), состояние: $health"
+            echo "Ограничение заряда: $([ "$LIMIT_ENABLED" = 1 ] && echo "вкл, $LOW–$HIGH%" || echo выкл)" \
+                "$([ "$FULL_ONCE" = 1 ] && echo "(сейчас разрешён полный заряд)")"
+            echo "Зарядка в контроллере: $([ "$allowed" = 1 ] && echo разрешена || echo запрещена)"
+            echo "Выключение при низком заряде: $([ "$LOWBAT_ENABLED" = 1 ] && echo "вкл, $LOWBAT_PERCENT%" || echo выкл)"
+            echo "Службы: chargelimit=$(service_running chargelimit) lowbattery=$(service_running lowbattery)"
+        fi
+        ;;
+    limit)
+        LIMIT_ENABLED=$(switch "$LIMIT_ENABLED" "${2:-toggle}")
+        [ "$LIMIT_ENABLED" = 1 ] || FULL_ONCE=0
+        save
+        echo "limit_enabled=$LIMIT_ENABLED"
+        ;;
+    range)
+        low=${2:-}
+        high=${3:-}
+        if ! [[ "$low" =~ ^[0-9]+$ && "$high" =~ ^[0-9]+$ ]] || [ "$low" -lt 20 ] ||
+            [ "$high" -gt 100 ] || [ $((high - low)) -lt 10 ]; then
+            echo "Range must be LOW HIGH with LOW >= 20, HIGH <= 100, HIGH - LOW >= 10" >&2
+            exit 2
+        fi
+        LOW=$low
+        HIGH=$high
+        save
+        echo "range=$LOW-$HIGH"
+        ;;
+    full)
+        FULL_ONCE=1
+        save
+        echo "full_once=1"
+        ;;
+    lowbat)
+        LOWBAT_ENABLED=$(switch "$LOWBAT_ENABLED" "${2:-toggle}")
+        save
+        echo "lowbat_enabled=$LOWBAT_ENABLED"
+        ;;
+    lowbat-percent)
+        percent=${2:-}
+        if ! [[ "$percent" =~ ^[0-9]+$ ]] || [ "$percent" -lt 5 ] || [ "$percent" -gt 30 ]; then
+            echo "Threshold must be 5-30" >&2
+            exit 2
+        fi
+        LOWBAT_PERCENT=$percent
+        save
+        echo "lowbat_percent=$LOWBAT_PERCENT"
+        ;;
+    *)
+        sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+        exit 2
+        ;;
+esac
