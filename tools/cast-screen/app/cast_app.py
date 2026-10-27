@@ -62,14 +62,19 @@ TEXT = {
         "devices": "DEVICES & SETTINGS", "on": "ON", "off": "OFF", "language_name": "English",
         "searching": "Searching the network…", "none": "No Chromecast found",
         "stop": "Stop casting", "rescan": "Search again",
-        "screen": "Handheld screen", "sound": "Handheld sound", "aspect": "Picture on TV",
+        "screen": "Screen on the handheld", "sound": "Sound on the handheld", "aspect": "Picture on TV",
         "bitrate": "Quality", "delay": "Latency", "fps": "Frame rate",
-        "keep": "ON", "off_casting": "OFF while casting",
+        "keep": "ON, here and on TV", "off_casting": "OFF, only on TV",
+        "screen_off_note": "Handheld screen goes dark while casting, the TV shows everything",
+        "sound_off_note": "Handheld speaker is silent while casting, the TV plays all sound",
+        "screen_on_note": "Handheld screen stays on while casting",
+        "sound_on_note": "Sound plays on the handheld and on the TV",
+        "stop_hint": "● CASTING · A stops",
         "aspect_values": {"4:3": "4:3 as is", "stretch": "Stretch to 16:9", "zoom": "Zoom to 16:9"},
         "bitrate_value": "{mbit} Mbit/s", "fps_value": "{fps} fps",
         "delay_values": {"150": "150 ms · low", "250": "250 ms · normal", "400": "400 ms · smoothest"},
         "language": "Language / Язык", "exit": "Exit",
-        "casting_here": "● CASTING", "default": "last used",
+        "default": "last used",
         "casting": "Casting", "idle": "Not casting", "connecting": "Connecting…",
         "for": "for {time}", "handheld_off": "Handheld: {what} off",
         "screen_word": "screen", "sound_word": "sound", "and": " and ",
@@ -78,22 +83,27 @@ TEXT = {
         "failed": "Could not connect: {reason}", "stopped": "Casting stopped",
         "restarting": "Casting restarts with the new setting…",
         "saved": "Saved, used on the next cast",
-        "footer": "D-pad — select    A — cast / change    X — search    B — exit",
+        "footer": "D-pad — select    A — cast / stop / change    X — search    B — exit",
     },
     "ru": {
         "title": "CHROMECAST", "subtitle": "Экран и звук на телевизор по Wi-Fi",
         "devices": "УСТРОЙСТВА И НАСТРОЙКИ", "on": "ВКЛ", "off": "ВЫКЛ", "language_name": "Русский",
         "searching": "Поиск в сети…", "none": "Chromecast не найден",
         "stop": "Остановить трансляцию", "rescan": "Искать снова",
-        "screen": "Экран приставки", "sound": "Звук приставки", "aspect": "Картинка на ТВ",
+        "screen": "Экран на приставке", "sound": "Звук на приставке", "aspect": "Картинка на ТВ",
         "bitrate": "Качество", "delay": "Задержка", "fps": "Частота кадров",
-        "keep": "ВКЛ", "off_casting": "ВЫКЛ при трансляции",
+        "keep": "ВКЛ, тут и на ТВ", "off_casting": "ВЫКЛ, только на ТВ",
+        "screen_off_note": "Экран приставки гаснет при трансляции, всё видно на ТВ",
+        "sound_off_note": "Динамик приставки молчит при трансляции, весь звук идёт на ТВ",
+        "screen_on_note": "Экран приставки остаётся включённым при трансляции",
+        "sound_on_note": "Звук и на приставке, и на телевизоре",
+        "stop_hint": "● ИДЁТ · A — стоп",
         "aspect_values": {"4:3": "4:3 как есть", "stretch": "Растянуть на 16:9",
                           "zoom": "Приблизить до 16:9"},
         "bitrate_value": "{mbit} Мбит/с", "fps_value": "{fps} к/с",
         "delay_values": {"150": "150 мс · низкая", "250": "250 мс · обычная", "400": "400 мс · плавнее"},
         "language": "Language / Язык", "exit": "Выход",
-        "casting_here": "● ТРАНСЛЯЦИЯ", "default": "последний",
+        "default": "последний",
         "casting": "Трансляция", "idle": "Трансляции нет", "connecting": "Подключение…",
         "for": "уже {time}", "handheld_off": "На приставке выключен {what}",
         "screen_word": "экран", "sound_word": "звук", "and": " и ",
@@ -102,7 +112,7 @@ TEXT = {
         "failed": "Не удалось подключиться: {reason}", "stopped": "Трансляция остановлена",
         "restarting": "Трансляция перезапускается с новой настройкой…",
         "saved": "Сохранено, применится при следующей трансляции",
-        "footer": "Крестовина — выбор    A — транслировать / изменить    X — поиск    B — выход",
+        "footer": "Крестовина — выбор    A — транслировать / стоп / изменить    X — поиск    B — выход",
     },
 }
 
@@ -294,7 +304,12 @@ class CastApp:
                 threading.Thread(target=work, daemon=True).start()
 
     def refresh(self):
+        items = self.items()
+        current = items[min(self.selected, len(items) - 1)]
         self.state, self.conf = cast_state(), cast_conf()
+        ids = [(row[0], row[1]) for row in self.items()]
+        if (current[0], current[1]) in ids:  # rows come and go (Stop, devices): stay on the same one
+            self.selected = ids.index((current[0], current[1]))
         self.refreshed = time.time()
         if self.pending:
             name, deadline, replaced = self.pending
@@ -309,10 +324,10 @@ class CastApp:
     def items(self):
         t, state = self.t, self.state
         casting_to = state.get("device") if state else None
-        rows = []
+        rows = [("stop", t["stop"], "", RED, None)] if state else []
         for name, model, ip in self.devices:
             if name == casting_to:
-                value, color = t["casting_here"], GREEN
+                value, color = t["stop_hint"], GREEN
             elif self.pending and self.pending[0] == name:
                 value, color = t["connecting"], YELLOW
             elif name == self.conf.get("device"):
@@ -324,8 +339,6 @@ class CastApp:
             rows.append(("info", t["searching"], "", MUTED, None))
         elif not self.devices:
             rows.append(("info", t["none"], "", MUTED, None))
-        if state:
-            rows.append(("stop", t["stop"], "", RED, None))
         conf = cast_settings(self.conf)
         for key in ("screen", "sound"):
             off = conf[key] == "off"
@@ -348,6 +361,8 @@ class CastApp:
         self.selected = min(self.selected, len(items) - 1)
         key, _, _, _, name = items[self.selected]
         t = self.t
+        if key == "device" and not direction and self.state and self.state.get("device") == name:
+            key = "stop"
         if key == "device" and not direction:
             run_tool("set", "device", name)
             run_background("background", name)  # stops a running cast first
@@ -362,7 +377,9 @@ class CastApp:
             value = values[(values.index(cast_settings(self.conf)[key]) + (direction or 1)) % len(values)]
             self.conf = dict(self.conf, **{key: value})  # shown at once; cast-screen saves it
             run_background("set", key, value)
-            if key not in ("screen", "sound"):
+            if key in ("screen", "sound"):
+                self.notify(t["%s_%s_note" % (key, value)], 4)
+            else:
                 if self.state:
                     self.pending = (self.state["device"], time.time() + 25, self.state.get("since"))
                 self.notify(t["restarting"] if self.state else t["saved"], 4)
@@ -480,8 +497,11 @@ class CastApp:
             if index == self.selected:
                 self.rect(panel_x + 10, top - 3, panel_w - 20, 33, SELECTED, 6)
                 self.rect(panel_x + 10, top - 3, 4, 33, CYAN, 2)
-            label_color = CYAN if index == self.selected else (MUTED if key == "info" else WHITE)
-            self.text(panel_x + 24, top, label, label_color, 14, key == "device", width=190)
+            if index == self.selected:
+                label_color = CYAN
+            else:
+                label_color = {"info": MUTED, "stop": RED}.get(key, WHITE)
+            self.text(panel_x + 24, top, label, label_color, 14, key in ("device", "stop"), width=200)
             if value:
                 self.text(panel_x + panel_w - 22, top + 15, value, color, 11, True, "right", 200)
         if self.top + ROWS < len(items):
