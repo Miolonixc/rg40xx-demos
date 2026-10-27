@@ -1,0 +1,939 @@
+#!/usr/bin/env python3
+"""Mirror the RG40XX H screen to a Chromecast over Wi-Fi (Cast Streaming, like Chrome's "Cast screen").
+
+Talks the Cast protocol directly with the standard library, OpenSSL's libcrypto and libopus, so
+nothing has to be installed on Knulli:
+
+  - control: TLS to port 8009, CastMessage protobufs, launches the mirroring receiver app
+    (0F5096E8) and negotiates the streams with OFFER/ANSWER;
+  - media: the visible /dev/fb0 page is read at a steady rate and ffmpeg encodes it to H.264,
+    parecord records the monitor of the default PipeWire output and libopus encodes it; every
+    frame is AES-128-CTR encrypted and split into Cast RTP packets; RTCP sender reports keep the
+    clocks (and lip sync) right, and packets the receiver reports lost are sent again.
+
+  cast-screen list [--raw]         Chromecast devices with a screen on the network
+  cast-screen start [NAME|IP]      mirror the screen until Ctrl+C / SIGTERM
+                                   (default: device= from /userdata/system/cast-screen.conf, else first found)
+  cast-screen background [NAME]    the same, detached, logging to /tmp/cast-screen.log
+  cast-screen probe [NAME|IP]      only launch the receiver and negotiate, then stop
+  cast-screen stop                 stop a running cast-screen
+  cast-screen status [--raw]       what is being cast where, and the settings
+  cast-screen set device NAME      default Chromecast
+  cast-screen set screen on|off    handheld screen while casting   } applied to a running cast at once
+  cast-screen set sound on|off     handheld speaker while casting  }
+  cast-screen set aspect 4:3|stretch|zoom   picture on a 16:9 TV   } a running cast restarts
+  cast-screen set bitrate 2000|3000|5000    kbit/s                 }
+  cast-screen set delay 150|250|400         receiver buffer, ms    }
+  cast-screen set fps 30|25|20                                     }
+
+Options for start override the settings: --aspect A, --delay MS, --bitrate KBPS, --fps N;
+also --no-audio (picture only) and -v (log every message).
+"""
+import collections
+import ctypes
+import fcntl
+import json
+import math
+import os
+import random
+import select
+import signal
+import socket
+import ssl
+import struct
+import subprocess
+import sys
+import threading
+import time
+import queue
+
+STATE = "/tmp/cast-screen.state"  # JSON of the running cast: pid, device, ip, since and the settings
+CONF = "/userdata/system/cast-screen.conf"  # device=NAME and the SETTINGS below
+LOG = "/tmp/cast-screen.log"
+FBIOGET_VSCREENINFO = 0x4600
+MIRRORING_APP = "0F5096E8"
+NS_CONNECTION = "urn:x-cast:com.google.cast.tp.connection"
+NS_HEARTBEAT = "urn:x-cast:com.google.cast.tp.heartbeat"
+NS_RECEIVER = "urn:x-cast:com.google.cast.receiver"
+NS_WEBRTC = "urn:x-cast:com.google.cast.webrtc"
+SENDER_ID = "sender-%d" % random.randint(10000, 99999)
+VERBOSE = False
+
+
+def log(*args):
+    print(time.strftime("%H:%M:%S"), *args, flush=True)
+
+
+# ---------------------------------------------------------------- discovery
+
+def read_conf():
+    conf = {}
+    try:
+        for line in open(CONF):
+            key, sep, value = line.strip().partition("=")
+            if sep:
+                conf[key] = value
+    except OSError:
+        pass
+    return conf
+
+
+def write_conf(**updates):
+    conf = dict(read_conf(), **updates)
+    with open(CONF + ".tmp", "w") as f:
+        f.write("".join("%s=%s\n" % kv for kv in conf.items()))
+    os.replace(CONF + ".tmp", CONF)
+
+
+def discover(timeout=5):
+    """Return [(friendly name, model, ip)] of Cast devices with a screen seen by avahi.
+
+    Speakers and speaker groups are left out: bit 0 of "ca" (capabilities) is video output."""
+    try:
+        out = subprocess.run(["avahi-browse", "-rtp", "_googlecast._tcp"], capture_output=True,
+                             text=True, timeout=timeout).stdout
+    except subprocess.TimeoutExpired as e:
+        out = (e.stdout or b"").decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+    devices = {}
+    for line in out.splitlines():
+        f = line.split(";")
+        if len(f) < 10 or f[0] != "=" or f[2] != "IPv4":
+            continue
+        txt = dict(t.strip('"').split("=", 1) for t in f[9].split('" "') if "=" in t)
+        if not int(txt.get("ca", "1") or "1") & 1:
+            continue
+        devices[f[7]] = (txt.get("fn", f[3]), txt.get("md", "?"), f[7])
+    return sorted(devices.values(), key=lambda d: d[0].lower())
+
+
+def resolve(target):
+    if target is None:
+        target = read_conf().get("device") or None
+    if target and all(c.isdigit() or c == "." for c in target):
+        return target, target
+    devices = discover()
+    for name, model, ip in devices:
+        if target is None or name.lower() == target.lower():
+            return name, ip
+    sys.exit("Chromecast %r not found (seen: %s)" % (target, ", ".join(d[0] for d in devices) or "none"))
+
+
+# ---------------------------------------------------------------- control channel
+
+def _varint(n):
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        out.append(b | (0x80 if n else 0))
+        if not n:
+            return bytes(out)
+
+
+def _field(num, value):
+    if isinstance(value, int):
+        return _varint(num << 3) + _varint(value)
+    data = value.encode() if isinstance(value, str) else value
+    return _varint(num << 3 | 2) + _varint(len(data)) + data
+
+
+def encode_message(src, dst, ns, payload):
+    """CastMessage: version, source, destination, namespace, payload type STRING, payload."""
+    return (_field(1, 0) + _field(2, src) + _field(3, dst) + _field(4, ns) + _field(5, 0)
+            + _field(6, json.dumps(payload, separators=(",", ":"))))
+
+
+def decode_message(data):
+    fields, i = {}, 0
+    while i < len(data):
+        key, shift = 0, 0
+        while True:
+            b = data[i]; i += 1
+            key |= (b & 0x7F) << shift; shift += 7
+            if not b & 0x80:
+                break
+        num, wire = key >> 3, key & 7
+        if wire == 0:
+            val, shift = 0, 0
+            while True:
+                b = data[i]; i += 1
+                val |= (b & 0x7F) << shift; shift += 7
+                if not b & 0x80:
+                    break
+        else:
+            n, shift = 0, 0
+            while True:
+                b = data[i]; i += 1
+                n |= (b & 0x7F) << shift; shift += 7
+                if not b & 0x80:
+                    break
+            val = data[i:i + n]; i += n
+        fields[num] = val
+    payload = fields.get(6, b"").decode(errors="replace")
+    try:
+        payload = json.loads(payload)
+    except ValueError:
+        pass
+    return fields.get(2, b"").decode(), fields.get(3, b"").decode(), fields.get(4, b"").decode(), payload
+
+
+class CastChannel:
+    def __init__(self, host):
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE  # Cast devices use self-signed certificates
+        self.sock = ctx.wrap_socket(socket.create_connection((host, 8009), timeout=10))
+        self.sock.settimeout(None)
+        self.lock = threading.Lock()
+        self.inbox = queue.Queue()
+        self.closed = threading.Event()
+        self.request_id = 0
+        threading.Thread(target=self._reader, daemon=True).start()
+        threading.Thread(target=self._heartbeat, daemon=True).start()
+        self.send(NS_CONNECTION, {"type": "CONNECT"})
+
+    def send(self, ns, payload, dst="receiver-0"):
+        if VERBOSE and ns != NS_HEARTBEAT:
+            log(">>", dst, ns.rsplit(".", 1)[-1], json.dumps(payload)[:300])
+        data = encode_message(SENDER_ID, dst, ns, payload)
+        with self.lock:
+            self.sock.sendall(struct.pack(">I", len(data)) + data)
+
+    def request(self, ns, payload, dst="receiver-0"):
+        self.request_id += 1
+        payload["requestId"] = self.request_id
+        self.send(ns, payload, dst)
+
+    def _recv_exact(self, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = self.sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("Chromecast closed the connection")
+            buf += chunk
+        return buf
+
+    def _reader(self):
+        try:
+            while True:
+                (length,) = struct.unpack(">I", self._recv_exact(4))
+                src, dst, ns, payload = decode_message(self._recv_exact(length))
+                if ns == NS_HEARTBEAT:
+                    if isinstance(payload, dict) and payload.get("type") == "PING":
+                        self.send(NS_HEARTBEAT, {"type": "PONG"}, src)
+                    continue
+                if VERBOSE:
+                    log("<<", src, ns.rsplit(".", 1)[-1], json.dumps(payload)[:300])
+                if ns == NS_CONNECTION and isinstance(payload, dict) and payload.get("type") == "CLOSE":
+                    log("Chromecast closed the session", src)
+                    self.closed.set()
+                self.inbox.put((src, ns, payload))
+        except (OSError, ConnectionError) as e:
+            if not self.closed.is_set():
+                log("control connection lost:", e)
+            self.closed.set()
+
+    def _heartbeat(self):
+        while not self.closed.wait(5):
+            try:
+                self.send(NS_HEARTBEAT, {"type": "PING"})
+            except OSError:
+                return
+
+    def wait_for(self, predicate, timeout=15):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                src, ns, payload = self.inbox.get(timeout=max(0.05, deadline - time.monotonic()))
+            except queue.Empty:
+                break
+            if isinstance(payload, dict) and predicate(src, ns, payload):
+                return payload
+        raise TimeoutError("no answer from the Chromecast")
+
+    def close(self):
+        self.closed.set()
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def launch_mirroring(ch):
+    ch.request(NS_RECEIVER, {"type": "LAUNCH", "appId": MIRRORING_APP})
+
+    def launched(src, ns, p):
+        if p.get("type") in ("LAUNCH_ERROR", "INVALID_REQUEST"):
+            sys.exit("Chromecast refused to launch mirroring: %s" % json.dumps(p))
+        apps = p.get("status", {}).get("applications", [])
+        return p.get("type") == "RECEIVER_STATUS" and any(a.get("appId") == MIRRORING_APP for a in apps)
+
+    status = ch.wait_for(launched, timeout=20)
+    app = next(a for a in status["status"]["applications"] if a["appId"] == MIRRORING_APP)
+    ch.send(NS_CONNECTION, {"type": "CONNECT"}, app["transportId"])
+    return app["transportId"], app["sessionId"]
+
+
+def negotiate(ch, transport_id, streams):
+    """Offer our streams, return the receiver's ANSWER and the streams it accepted."""
+    offer = {
+        "type": "OFFER", "seqNum": random.randint(1, 1 << 30),
+        "offer": {"castMode": "mirroring", "receiverGetStatus": True,
+                  "supportedStreams": [dict(s.offer(), index=i) for i, s in enumerate(streams)]},
+    }
+    ch.send(NS_WEBRTC, offer, transport_id)
+    answer = ch.wait_for(lambda s, ns, p: ns == NS_WEBRTC and p.get("type") == "ANSWER")
+    if answer.get("result") != "ok" or "answer" not in answer:
+        sys.exit("Chromecast rejected the stream: %s" % json.dumps(answer))
+    answer = answer["answer"]
+    accepted = [s for i, s in enumerate(streams) if i in answer.get("sendIndexes", [])]
+    if not accepted:
+        sys.exit("Chromecast accepted none of the streams: %s" % json.dumps(answer))
+    return answer, accepted
+
+
+# ---------------------------------------------------------------- media
+
+class AesCtr:
+    """AES-128-CTR from the system libcrypto (Python on Knulli has no crypto module)."""
+
+    def __init__(self, key):
+        self.lib = ctypes.CDLL("libcrypto.so.3")
+        self.lib.EVP_CIPHER_CTX_new.restype = ctypes.c_void_p
+        self.lib.EVP_aes_128_ctr.restype = ctypes.c_void_p
+        self.lib.EVP_EncryptInit_ex.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_char_p] * 2
+        self.lib.EVP_EncryptUpdate.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
+                                               ctypes.POINTER(ctypes.c_int), ctypes.c_char_p, ctypes.c_int]
+        self.ctx = ctypes.c_void_p(self.lib.EVP_CIPHER_CTX_new())
+        self.lib.EVP_EncryptInit_ex(self.ctx, self.lib.EVP_aes_128_ctr(), None, key, None)
+
+    def encrypt(self, iv, data):
+        self.lib.EVP_EncryptInit_ex(self.ctx, None, None, None, iv)
+        out = ctypes.create_string_buffer(len(data))
+        n = ctypes.c_int(0)
+        self.lib.EVP_EncryptUpdate(self.ctx, out, ctypes.byref(n), data, len(data))
+        return out.raw[:n.value]
+
+
+def ntp_now(wall):
+    secs = wall + 2208988800  # 1900 epoch
+    return int(secs), int((secs % 1) * (1 << 32))
+
+
+class OpusEncoder:
+    """Opus from the system libopus (the one ffmpeg links against)."""
+
+    def __init__(self, rate, channels, bitrate):
+        self.lib = ctypes.CDLL("libopus.so.0")
+        self.lib.opus_encoder_create.restype = ctypes.c_void_p
+        self.lib.opus_encoder_create.argtypes = [ctypes.c_int32, ctypes.c_int, ctypes.c_int,
+                                                 ctypes.POINTER(ctypes.c_int)]
+        self.lib.opus_encode.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int,
+                                         ctypes.c_char_p, ctypes.c_int32]
+        err = ctypes.c_int(0)
+        self.channels = channels
+        self.enc = ctypes.c_void_p(self.lib.opus_encoder_create(rate, channels, 2049, ctypes.byref(err)))
+        if err.value or not self.enc:
+            raise RuntimeError("opus_encoder_create failed: %d" % err.value)  # 2049 = APPLICATION_AUDIO
+        self.lib.opus_encoder_ctl(self.enc, ctypes.c_int(4002), ctypes.c_int32(bitrate))  # SET_BITRATE
+        self.out = ctypes.create_string_buffer(4000)
+
+    def encode(self, pcm):
+        n = self.lib.opus_encode(self.enc, pcm, len(pcm) // (2 * self.channels), self.out, len(self.out))
+        if n < 0:
+            raise RuntimeError("opus_encode failed: %d" % n)
+        return self.out.raw[:n]
+
+
+class RtpStream:
+    """One Cast stream: each frame is AES-CTR encrypted, cut into Cast RTP packets and kept for resending."""
+    MAX_PACKET = 1400
+    HISTORY = 128  # frames kept for retransmission
+
+    def __init__(self, kind, payload_type, clock, delay_ms, **codec):
+        self.kind, self.payload_type, self.clock, self.delay_ms = kind, payload_type, clock, delay_ms
+        self.codec = codec
+        self.ssrc = random.randint(1, 0x7FFFFFFF)
+        self.key, self.iv_mask = os.urandom(16), os.urandom(16)
+        self.aes = AesCtr(self.key)
+        self.session = None
+        self.frame_id = -1
+        self.seq = 0
+        self.packets = {}  # frame_id & 0xFF -> [packets]
+        self.sent_packets = self.sent_octets = 0
+        self.stats = {"frames": 0, "bytes": 0, "resent": 0, "dropped": 0, "acked": None, "keyreq": 0}
+        self.last_ack_change = time.monotonic()
+
+    def offer(self):
+        return dict(self.codec, type=self.kind + "_source", rtpProfile="cast",
+                    rtpPayloadType=self.payload_type, ssrc=self.ssrc, targetDelay=self.delay_ms,
+                    aesKey=self.key.hex(), aesIvMask=self.iv_mask.hex(), receiverRtcpEventLog=False,
+                    timeBase="1/%d" % self.clock)
+
+    def send_frame(self, frame, ts, key):
+        self.frame_id += 1
+        fid = self.frame_id
+        nonce = bytearray(self.iv_mask)
+        for i, b in enumerate(struct.pack(">I", fid & 0xFFFFFFFF)):
+            nonce[8 + i] ^= b
+        data = self.aes.encrypt(bytes(nonce), frame)
+
+        first = fid == 0
+        chunk = self.MAX_PACKET - (12 + 7 + (4 if first else 0))
+        count = max(1, -(-len(data) // chunk))
+        ref = fid if key else fid - 1
+        packets = []
+        for pid in range(count):
+            ext = first and pid == 0
+            hdr = struct.pack(">BBHII", 0x80, (0x80 if pid == count - 1 else 0) | self.payload_type,
+                              self.seq & 0xFFFF, ts & 0xFFFFFFFF, self.ssrc)
+            self.seq += 1
+            hdr += struct.pack(">BBHHB", (0x80 if key else 0) | 0x40 | (1 if ext else 0),
+                               fid & 0xFF, pid, count - 1, ref & 0xFF)
+            if ext:  # adaptive latency extension: tell the receiver the playout delay
+                hdr += struct.pack(">HH", (1 << 10) | 2, self.delay_ms)
+            packets.append(hdr + data[pid * chunk:(pid + 1) * chunk])
+        self.packets[fid & 0xFF] = packets
+        self.packets.pop((fid - self.HISTORY) & 0xFF, None)
+        for p in packets:
+            self.send(p)
+        self.stats["frames"] += 1
+        self.stats["bytes"] += len(frame)
+
+    def send(self, packet, media=True):
+        if not self.session.send(packet):
+            self.stats["dropped"] += 1
+        elif media:
+            self.sent_packets += 1
+            self.sent_octets += len(packet) - 12
+
+    def send_report(self, now):
+        sec, frac = ntp_now(self.session.wall0 + (now - self.session.t0))
+        sr = struct.pack(">BBHIIIIII", 0x80, 200, 6, self.ssrc, sec, frac, self.session.rtp_time(self, now),
+                         self.sent_packets & 0xFFFFFFFF, self.sent_octets & 0xFFFFFFFF)
+        self.send(sr, media=False)
+
+    def on_cast_feedback(self, body):
+        ack, nloss = body[16], body[17]
+        if ack != self.stats["acked"]:
+            self.last_ack_change = time.monotonic()
+        self.stats["acked"] = ack
+        for k in range(nloss):
+            off = 20 + 4 * k
+            if off + 4 > len(body):
+                break
+            fid8, pid, mask = body[off], struct.unpack(">H", body[off + 1:off + 3])[0], body[off + 3]
+            packets = self.packets.get(fid8)
+            if not packets:
+                continue
+            if pid == 0xFFFF:
+                wanted = range(len(packets))
+            else:
+                wanted = [pid] + [pid + b + 1 for b in range(8) if mask & (1 << b)]
+            for p in wanted:
+                if p < len(packets):
+                    self.send(packets[p])
+                    self.stats["resent"] += 1
+
+    def summary(self, dt):
+        s = self.stats
+        line = "%s: %d frames (%.0f/s, %d kbit/s), acked %s, resent %d, dropped %d" % (
+            self.kind, s["frames"], s["frames"] / dt, s["bytes"] * 8 / dt / 1000, s["acked"], s["resent"],
+            s["dropped"])
+        if s["keyreq"]:
+            line += ", key frame requests %d" % s["keyreq"]
+        self.stats.update(frames=0, bytes=0, resent=0, dropped=0, keyreq=0)
+        return line
+
+
+class Session:
+    """Screen (ffmpeg, /dev/fb0 -> H.264) and sound (parecord, monitor of the default output -> Opus)."""
+    AUDIO_RATE, AUDIO_FRAME, AUDIO_BITRATE = 48000, 960, 128000  # 20 ms Opus frames
+
+    def __init__(self, fps, bitrate, delay_ms, audio=True, aspect="4:3"):
+        self.fps, self.bitrate, self.aspect = fps, bitrate, aspect
+        self.video = RtpStream("video", 96, 90000, delay_ms, codecName="h264",
+                               maxFrameRate="%d000/1000" % fps, maxBitRate=bitrate * 1000,
+                               resolutions=[{"width": 1280, "height": 720}])
+        self.audio = RtpStream("audio", 127, self.AUDIO_RATE, delay_ms, codecName="opus", channels=2,
+                               sampleRate=self.AUDIO_RATE, bitRate=self.AUDIO_BITRATE) if audio else None
+        self.streams = [s for s in (self.audio, self.video) if s]
+        for s in self.streams:
+            s.session = self
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
+        # A real-time stream must never wait for Wi-Fi: a packet that does not fit is dropped and
+        # the receiver asks for it again, instead of stalling the encoder and piling up latency.
+        self.sock.setblocking(False)
+        self.lock = threading.Lock()
+        self.dest = None
+        self.t0 = time.monotonic()
+        self.wall0 = time.time()
+        self.stop = threading.Event()
+        self.procs = []
+        self.capture_times = collections.deque()
+
+    def rtp_time(self, stream, t):
+        return int((t - self.t0) * stream.clock) & 0xFFFFFFFF
+
+    def send(self, packet):
+        try:
+            with self.lock:
+                self.sock.sendto(packet, self.dest)
+            return True
+        except OSError:  # send buffer full or network down
+            return False
+
+    def video_filter(self, width, height):
+        """How the 4:3 handheld picture meets a 16:9 TV.
+
+        stretch: the pixels are marked as wide in the H.264 stream (sample aspect ratio), so the TV
+        stretches the picture at no cost here; zoom: the middle 16:9 strip is cut out, losing the top
+        and bottom of the screen but keeping proportions."""
+        if self.aspect == "stretch":
+            num, den = 16 * height, 9 * width
+            g = math.gcd(num, den)
+            return "setsar=%d/%d,format=yuv420p" % (num // g, den // g)
+        if self.aspect == "zoom":
+            crop = width * 9 // 16 // 2 * 2
+            return "crop=%d:%d:0:%d,format=yuv420p" % (width, crop, (height - crop) // 2)
+        return "format=yuv420p"
+
+    def start(self, receiver_ip, port, streams):
+        self.dest = (receiver_ip, port)
+        self.streams = streams
+        now = time.monotonic()
+        for s in streams:
+            s.send_report(now)
+        if self.video in streams:
+            fb = os.open("/dev/fb0", os.O_RDONLY)
+            var = bytearray(160)
+            fcntl.ioctl(fb, FBIOGET_VSCREENINFO, var)
+            os.close(fb)
+            width, height, virtual_width = struct.unpack_from("<III", var, 0)
+            bpp = struct.unpack_from("<I", var, 24)[0]
+            if bpp != 32:
+                sys.exit("unsupported framebuffer depth: %d bits" % bpp)
+            cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "bgr0",
+                   "-video_size", "%dx%d" % (width, height), "-framerate", str(self.fps), "-i", "pipe:0",
+                   "-sws_flags", "fast_bilinear", "-vf", self.video_filter(width, height), "-c:v", "libx264",
+                   "-preset", "ultrafast", "-tune", "zerolatency", "-b:v", "%dk" % self.bitrate,
+                   "-maxrate", "%dk" % self.bitrate, "-bufsize", "%dk" % (self.bitrate // 4),
+                   "-g", str(self.fps * 2), "-x264-params", "aud=1:repeat-headers=1", "-fps_mode", "passthrough",
+                   "-flush_packets", "1", "-f", "h264", "pipe:1"]
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
+            self.procs.append(proc)
+            threading.Thread(target=self._capture_loop, args=(proc, width * height * 4, virtual_width * 4),
+                             daemon=True).start()
+            threading.Thread(target=self._video_loop, args=(proc,), daemon=True).start()
+        if self.audio in streams:
+            cmd = ["parecord", "--raw", "--format=s16le", "--rate=%d" % self.AUDIO_RATE, "--channels=2",
+                   "--latency-msec=10", "-d", "@DEFAULT_MONITOR@"]
+            self.procs.append(subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=0))
+            threading.Thread(target=self._audio_loop, args=(self.procs[-1],), daemon=True).start()
+        for target in (self._rtcp_loop, self._report_loop):
+            threading.Thread(target=target, daemon=True).start()
+
+    def close(self):
+        self.stop.set()
+        for p in self.procs:
+            if p.poll() is None:
+                p.terminate()
+        for p in self.procs:
+            try:
+                p.wait(3)
+            except subprocess.TimeoutExpired:
+                p.kill()
+
+    @staticmethod
+    def _is_idr(au):
+        i = au.find(b"\x00\x00\x01")
+        while 0 <= i < len(au) - 3:
+            if au[i + 3] & 0x1F == 5:
+                return True
+            i = au.find(b"\x00\x00\x01", i + 3)
+        return False
+
+    def _capture_loop(self, proc, frame_bytes, stride):
+        """Feed the visible framebuffer page to ffmpeg at a steady rate.
+
+        ffmpeg's own fbdev input memcpy()s from an uncached mmap, about 14 ms of CPU per frame here;
+        pread() on /dev/fb0 goes through the kernel and is about four times cheaper."""
+        fb = os.open("/dev/fb0", os.O_RDONLY)
+        out = proc.stdin.fileno()
+        var = bytearray(160)
+        period = 1.0 / self.fps
+        next_t = time.monotonic()
+        try:
+            while not self.stop.is_set():
+                now = time.monotonic()
+                if next_t > now:
+                    time.sleep(next_t - now)
+                elif now - next_t > period:
+                    next_t = now  # fell behind (ffmpeg busy): drop frames rather than catch up
+                fcntl.ioctl(fb, FBIOGET_VSCREENINFO, var)  # the page being shown right now
+                frame = os.pread(fb, frame_bytes, struct.unpack_from("<I", var, 20)[0] * stride)
+                if len(frame) != frame_bytes:
+                    continue
+                self.capture_times.append(time.monotonic())
+                view = memoryview(frame)
+                while view:
+                    view = view[os.write(out, view):]
+                next_t += period
+        except OSError:  # ffmpeg exited
+            pass
+        finally:
+            os.close(fb)
+
+    def _video_loop(self, proc):
+        """Split the Annex B stream into access units at the AUD (00 00 00 01 09) x264 puts first.
+
+        x264 turns every captured frame into exactly one access unit, in order, so each one is stamped
+        with the moment its frame was read from the screen."""
+        aud = b"\x00\x00\x00\x01\x09"
+        buf = b""
+        fd = proc.stdout.fileno()
+        while not self.stop.is_set():
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                log("ffmpeg stopped")
+                break
+            buf += chunk
+            while True:
+                end = buf.find(aud, 1)
+                if end < 0:
+                    break
+                au, buf = buf[:end], buf[end:]
+                captured = self.capture_times.popleft() if self.capture_times else time.monotonic()
+                self.video.send_frame(au, self.rtp_time(self.video, captured), self._is_idr(au))
+        self.stop.set()
+
+    def _audio_loop(self, proc):
+        """Encode 20 ms of PCM at a time; timestamps count samples, re-anchored if the clocks drift apart."""
+        opus = OpusEncoder(self.AUDIO_RATE, 2, self.AUDIO_BITRATE)
+        frame_bytes = self.AUDIO_FRAME * 4
+        fd = proc.stdout.fileno()
+        buf, ts = b"", None
+        while not self.stop.is_set():
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                log("sound capture stopped, casting the picture only")
+                return
+            buf += chunk
+            now = time.monotonic()
+            while len(buf) >= frame_bytes:
+                pcm, buf = buf[:frame_bytes], buf[frame_bytes:]
+                # first sample of this frame, assuming everything still in buf was captured just now
+                captured = now - (len(buf) + frame_bytes) / 4 / self.AUDIO_RATE
+                expected = self.rtp_time(self.audio, captured)
+                if ts is None or abs((expected - ts + (1 << 31)) % (1 << 32) - (1 << 31)) > self.AUDIO_RATE // 10:
+                    ts = expected
+                self.audio.send_frame(opus.encode(pcm), ts, key=True)
+                ts = (ts + self.AUDIO_FRAME) & 0xFFFFFFFF
+
+    def _report_loop(self):
+        last_log = time.monotonic()
+        while not self.stop.wait(0.5):
+            now = time.monotonic()
+            for s in self.streams:
+                s.send_report(now)
+            if now - max(s.last_ack_change for s in self.streams) > 20:
+                log("receiver stopped acknowledging frames for 20 s, giving up")
+                self.stop.set()
+                return
+            if now - last_log >= 5:
+                log("; ".join(s.summary(now - last_log) for s in self.streams))
+                last_log = now
+
+    def _rtcp_loop(self):
+        by_ssrc = {s.ssrc: s for s in self.streams}
+        while not self.stop.is_set():
+            try:
+                if not select.select([self.sock], [], [], 0.5)[0]:
+                    continue
+                data, _ = self.sock.recvfrom(2048)
+            except BlockingIOError:
+                continue
+            except OSError:
+                return
+            i = 0
+            while i + 4 <= len(data):
+                fmt, pt = data[i] & 0x1F, data[i + 1]
+                size = (struct.unpack(">H", data[i + 2:i + 4])[0] + 1) * 4
+                body = data[i:i + size]
+                i += size
+                stream = by_ssrc.get(struct.unpack(">I", body[8:12])[0]) if len(body) >= 12 else None
+                if pt != 206 or stream is None:
+                    continue
+                if fmt == 15 and body[12:16] == b"CAST":
+                    stream.on_cast_feedback(body)
+                elif fmt == 1:
+                    stream.stats["keyreq"] += 1
+
+
+# ---------------------------------------------------------------- commands
+
+def wifi_power_save(state=None):
+    """Return {interface: "on"/"off"} for Wi-Fi power save, setting it first when state is given.
+
+    With power save on, the Realtek chip naps between beacons and packets wait up to ~200 ms."""
+    try:
+        out = subprocess.run(["iw", "dev"], capture_output=True, text=True).stdout
+    except OSError:
+        return {}
+    result = {}
+    for iface in (l.split()[1] for l in out.splitlines() if l.strip().startswith("Interface ")):
+        want = state.get(iface) if isinstance(state, dict) else state
+        if want:
+            subprocess.run(["iw", "dev", iface, "set", "power_save", want], capture_output=True)
+        res = subprocess.run(["iw", "dev", iface, "get", "power_save"], capture_output=True, text=True)
+        if "Power save:" in res.stdout:
+            result[iface] = res.stdout.split(":")[1].strip()
+    return result
+
+
+def _output(cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+# Settings in CONF: allowed values (first is the default) and whether a running cast picks them up
+# at once (the handheld's own screen and sound) or has to be restarted (everything about the stream).
+SETTINGS = {
+    "screen": (("on", "off"), True),     # handheld screen while casting
+    "sound": (("on", "off"), True),      # handheld speaker while casting
+    "aspect": (("4:3", "stretch", "zoom"), False),
+    "bitrate": (("3000", "2000", "5000"), False),  # kbit/s
+    "delay": (("250", "150", "400"), False),       # receiver buffer, ms
+    "fps": (("30", "25", "20"), False),
+}
+
+
+def settings():
+    conf = read_conf()
+    if conf.get("gamepad") == "on":  # older single switch for both
+        conf.setdefault("screen", "off")
+        conf.setdefault("sound", "off")
+    return {key: conf.get(key) if conf.get(key) in values else values[0]
+            for key, (values, _) in SETTINGS.items()}
+
+
+class Handheld:
+    """The handheld's own screen and speaker while casting, for using it as just a gamepad.
+
+    The screen goes dark with the backlight at 0 (not Knulli's fb blank, which could hold up games
+    waiting for vsync); the sound by muting the PipeWire output, which silences the speaker but not
+    the monitor that is cast (switching LINEOUT off in the mixer breaks the capture instead)."""
+
+    def __init__(self):
+        self.brightness = self.mute = None  # saved values while switched off
+
+    def apply(self, screen_on, sound_on):
+        if not screen_on and self.brightness is None:
+            self.brightness = _output(["brightness", "get"])
+            _output(["brightness", "set", "0"])
+            log("handheld screen off")
+        elif screen_on and self.brightness is not None:
+            if self.brightness.isdigit() and int(self.brightness) > 0:
+                _output(["brightness", "set", self.brightness])
+            self.brightness = None
+            log("handheld screen back on")
+        if not sound_on and self.mute is None:
+            self.mute = _output(["pactl", "get-sink-mute", "@DEFAULT_SINK@"])
+            _output(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "1"])
+            log("handheld speaker muted")
+        elif sound_on and self.mute is not None:
+            if not self.mute.endswith("yes"):
+                _output(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "0"])
+            self.mute = None
+            log("handheld speaker back on")
+
+
+def read_state():
+    try:
+        state = json.load(open(STATE))
+        os.kill(state["pid"], 0)
+        return state
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def write_state(**state):
+    with open(STATE + ".tmp", "w") as f:
+        json.dump(dict(state, pid=os.getpid()), f)
+    os.replace(STATE + ".tmp", STATE)
+
+
+def cmd_list(raw=False):
+    devices = discover()
+    for name, model, ip in devices:
+        print(("%s\t%s\t%s" if raw else "%-24s %-22s %s") % (name, model, ip))
+    if not devices and not raw:
+        print("no Chromecast devices found")
+
+
+def cmd_start(target, opts, probe=False):
+    if not probe:
+        cmd_stop(quiet=True)
+        # visible to "stop" (and a restart) already while connecting
+        write_state(device=target or read_conf().get("device", ""), ip="", since=int(time.time()), connecting=True)
+    conf = settings()
+    for key in ("fps", "bitrate", "delay", "aspect"):
+        if opts[key] is None:
+            opts[key] = conf[key] if key == "aspect" else int(conf[key])
+    name, ip = resolve(target)
+    log("connecting to %s (%s)" % (name, ip))
+    ch = CastChannel(ip)
+    transport_id, session_id = launch_mirroring(ch)
+    log("mirroring receiver started, session", session_id)
+    media = Session(opts["fps"], opts["bitrate"], opts["delay"], audio=opts["audio"], aspect=opts["aspect"])
+    handheld = Handheld()
+    stopping, reload = threading.Event(), threading.Event()
+
+    def shutdown(*_):
+        stopping.set()
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGUSR1, lambda *_: reload.set())  # "cast-screen set screen|sound" while casting
+    power_save = {}
+    try:
+        answer, streams = negotiate(ch, transport_id, media.streams)
+        log("receiver answered:", json.dumps(answer))
+        log("streaming %s: %d fps, %d kbit/s, %d ms delay, picture %s" % (
+            " and ".join(s.kind for s in streams), opts["fps"], opts["bitrate"], opts["delay"], opts["aspect"]))
+        if not probe:
+            power_save = wifi_power_save()
+            log("Wi-Fi power save off:", wifi_power_save("off"))
+            media.start(ip, answer["udpPort"], streams)
+            since = int(time.time())
+            reload.set()
+            while not (stopping.is_set() or ch.closed.is_set() or media.stop.is_set()):
+                if reload.is_set():
+                    reload.clear()
+                    conf = settings()
+                    handheld.apply(conf["screen"] == "on", conf["sound"] == "on")
+                    write_state(device=name, ip=ip, since=since, **conf)
+                stopping.wait(0.5)
+    finally:
+        handheld.apply(True, True)
+        media.close()
+        if power_save:
+            wifi_power_save(power_save)
+        if not ch.closed.is_set():
+            try:
+                ch.request(NS_RECEIVER, {"type": "STOP", "sessionId": session_id})
+                time.sleep(0.3)
+            except OSError:
+                pass
+        ch.close()
+        state = read_state()
+        if not probe and state and state["pid"] == os.getpid():
+            os.remove(STATE)
+        log("stopped")
+
+
+def cmd_stop(quiet=False):
+    state = read_state()
+    if not state:
+        if not quiet:
+            print("cast-screen is not running")
+        return
+    os.kill(state["pid"], signal.SIGTERM)
+    for _ in range(50):  # let it send STOP to the Chromecast and bring the screen back
+        try:
+            os.kill(state["pid"], 0)
+        except OSError:
+            break
+        time.sleep(0.1)
+    if not quiet:
+        print("stopped casting to", state["device"])
+
+
+def start_background(device):
+    """Start casting detached from the caller (the app or a menu script), logging to LOG."""
+    cmd_stop(quiet=True)  # before truncating the log the running cast still writes to
+    with open(LOG, "w") as log_file:
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), "start", device], stdout=log_file,
+                         stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+
+
+def cmd_status(raw=False):
+    state = read_state()
+    conf = settings()
+    if raw:
+        print("casting=%d" % bool(state and not state.get("connecting")))
+        if state:
+            print("device=%s\nip=%s\nsince=%d" % (state["device"], state["ip"], state["since"]))
+        print("default=%s" % read_conf().get("device", ""))
+        print("".join("%s=%s\n" % kv for kv in conf.items()), end="")
+    elif state and state.get("connecting"):
+        print("connecting to", state["device"] or "the default Chromecast")
+    elif state:
+        print("casting to %s (%s) for %d s" % (state["device"], state["ip"], time.time() - state["since"]))
+    else:
+        print("not casting")
+    if not raw:
+        print("settings: " + ", ".join("%s=%s" % kv for kv in conf.items()))
+
+
+def cmd_set(key, value):
+    if key == "device" and value:
+        write_conf(device=value)
+        return
+    if key not in SETTINGS or value not in SETTINGS[key][0]:
+        sys.exit("usage: cast-screen set device NAME | " + " | ".join(
+            "set %s %s" % (k, "|".join(v)) for k, (v, _) in SETTINGS.items()))
+    write_conf(**{key: value})
+    state = read_state()
+    if not state:
+        return
+    if SETTINGS[key][1]:
+        os.kill(state["pid"], signal.SIGUSR1)
+    else:  # the stream itself changes: cast again to the same device
+        cmd_stop(quiet=True)
+        start_background(state["device"])
+        print("restarting the cast to", state["device"])
+
+
+def main(argv):
+    global VERBOSE
+    opts = {"delay": None, "bitrate": None, "fps": None, "aspect": None, "audio": True}
+    args, raw = [], False
+    it = iter(argv)
+    for a in it:
+        if a == "-v":
+            VERBOSE = True
+        elif a == "--raw":
+            raw = True
+        elif a == "--no-audio":
+            opts["audio"] = False
+        elif a in ("--delay", "--bitrate", "--fps"):
+            opts[a[2:]] = int(next(it))
+        elif a == "--aspect":
+            opts["aspect"] = next(it)
+        else:
+            args.append(a)
+    if not args:
+        sys.exit(__doc__)
+    command, target = args[0], (args[1] if len(args) > 1 else None)
+    if command == "list":
+        cmd_list(raw)
+    elif command in ("start", "probe"):
+        cmd_start(target, opts, probe=command == "probe")
+    elif command == "background":
+        start_background(target or read_conf().get("device", ""))
+    elif command == "stop":
+        cmd_stop()
+    elif command == "status":
+        cmd_status(raw)
+    elif command == "set":
+        cmd_set(target, " ".join(args[2:]) or None)
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
