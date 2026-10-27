@@ -1,7 +1,7 @@
 #!/bin/bash
-# Battery tools for the RG40XX H on Knulli: charge limit and low-battery shutdown settings.
-# Settings live in one file read by the chargelimit and lowbattery services on every check,
-# so changes apply within half a minute without restarting anything.
+# Battery tools for the RG40XX H on Knulli: charge limit, low-battery shutdown and charger
+# vibration settings. Settings live in one file read by the chargelimit, lowbattery and
+# chargevibe services on every check, so changes apply without restarting anything.
 #
 #   battery-tools status              human-readable state
 #   battery-tools status --raw        key=value lines for the Battery app
@@ -10,6 +10,7 @@
 #   battery-tools full                allow one charge to 100%, then the limit returns
 #   battery-tools lowbat on|off|toggle shutdown at low battery
 #   battery-tools lowbat-percent N    shutdown threshold, 5-30%
+#   battery-tools vibrate on|off|toggle buzz when a charger is plugged in
 set -u
 CONF=/userdata/system/configs/battery-tools.conf
 BATTERY=/sys/class/power_supply/axp2202-battery
@@ -21,6 +22,7 @@ HIGH=60
 FULL_ONCE=0
 LOWBAT_ENABLED=1
 LOWBAT_PERCENT=15
+VIBRATE_ON_CHARGE=1
 # shellcheck source=/dev/null
 [ -f "$CONF" ] && . "$CONF"
 
@@ -33,6 +35,7 @@ HIGH=$HIGH
 FULL_ONCE=$FULL_ONCE
 LOWBAT_ENABLED=$LOWBAT_ENABLED
 LOWBAT_PERCENT=$LOWBAT_PERCENT
+VIBRATE_ON_CHARGE=$VIBRATE_ON_CHARGE
 EOF
     mv "$CONF.tmp" "$CONF"
 }
@@ -88,8 +91,10 @@ case "${1:-status}" in
             echo "full_once=$FULL_ONCE"
             echo "lowbat_enabled=$LOWBAT_ENABLED"
             echo "lowbat_percent=$LOWBAT_PERCENT"
+            echo "vibrate_enabled=$VIBRATE_ON_CHARGE"
             echo "chargelimit_service=$(service_running chargelimit)"
             echo "lowbattery_service=$(service_running lowbattery)"
+            echo "chargevibe_service=$(service_running chargevibe)"
         else
             echo "Батарея: $capacity% ($status), зарядка подключена: $([ "$online" = 1 ] && echo да || echo нет)"
             echo "Напряжение: $voltage мкВ, температура: $temp (десятые °C), состояние: $health"
@@ -97,7 +102,9 @@ case "${1:-status}" in
                 "$([ "$FULL_ONCE" = 1 ] && echo "(сейчас разрешён полный заряд)")"
             echo "Зарядка в контроллере: $([ "$allowed" = 1 ] && echo разрешена || echo запрещена)"
             echo "Выключение при низком заряде: $([ "$LOWBAT_ENABLED" = 1 ] && echo "вкл, $LOWBAT_PERCENT%" || echo выкл)"
-            echo "Службы: chargelimit=$(service_running chargelimit) lowbattery=$(service_running lowbattery)"
+            echo "Вибрация при подключении зарядки: $([ "$VIBRATE_ON_CHARGE" = 1 ] && echo вкл || echo выкл)"
+            echo "Службы: chargelimit=$(service_running chargelimit) lowbattery=$(service_running lowbattery)" \
+                "chargevibe=$(service_running chargevibe)"
         fi
         ;;
     limit)
@@ -139,8 +146,13 @@ case "${1:-status}" in
         save
         echo "lowbat_percent=$LOWBAT_PERCENT"
         ;;
+    vibrate)
+        VIBRATE_ON_CHARGE=$(switch "$VIBRATE_ON_CHARGE" "${2:-toggle}")
+        save
+        echo "vibrate_enabled=$VIBRATE_ON_CHARGE"
+        ;;
     *)
-        sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
         exit 2
         ;;
 esac

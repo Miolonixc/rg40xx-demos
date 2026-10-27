@@ -11,7 +11,7 @@ COPYFILE_DISABLE=1 tar --no-xattrs -C "$HERE" -cf - battery-tools services app |
 STAGE=$(mktemp -d)
 tar -C "$STAGE" -xf -
 install -m 755 "$STAGE/battery-tools" /userdata/system/bin/battery-tools
-for service in chargelimit lowbattery; do
+for service in chargelimit lowbattery chargevibe; do
     install -m 755 "$STAGE/services/$service" /userdata/system/services/$service
 done
 mkdir -p /userdata/roms/tools/battery
@@ -19,7 +19,7 @@ install -m 644 "$STAGE/app/battery_app.py" /userdata/roms/tools/battery/battery_
 install -m 755 "$STAGE/app/Battery.sh" /userdata/roms/tools/Battery.sh
 rm -rf "$STAGE"
 [ -f /userdata/system/configs/battery-tools.conf ] || /userdata/system/bin/battery-tools range 40 60 >/dev/null
-for service in chargelimit lowbattery; do
+for service in chargelimit lowbattery chargevibe; do
     knulli-services enable $service >/dev/null 2>&1 || true
     /userdata/system/services/$service stop >/dev/null 2>&1 || true
     /userdata/system/services/$service start
@@ -41,8 +41,8 @@ if game is None:
     game = ET.SubElement(root, "game")
 fields = (("path", "./Battery.sh"), ("name", "Battery"),
           ("desc", "Charge limit while plugged in (40-60%, 50-80% or 20-80%), a one-time full "
-                   "charge on request, low-battery shutdown and battery status. English or "
-                   "Russian, switched in the app."),
+                   "charge on request, low-battery shutdown, a buzz on plugging in the charger "
+                   "and battery status. English or Russian, switched in the app."),
           ("image", "./images/battery.png"), ("developer", "rg40xx-demos"),
           ("genre", "System Tools"))
 changed = False

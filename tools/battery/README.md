@@ -1,6 +1,6 @@
 # Батарея для RG40XX H (Knulli)
 
-Ограничение заряда на зарядке и корректное выключение при низком заряде, с приложением в разделе «Инструменты».
+Ограничение заряда на зарядке, корректное выключение при низком заряде и вибрация при подключении зарядки, с приложением в разделе «Инструменты».
 
 ## Что входит
 
@@ -9,9 +9,10 @@
 | `battery-tools` | `/userdata/system/bin/` | Утилита: состояние и все настройки |
 | `services/chargelimit` | `/userdata/system/services/` | Держит заряд в диапазоне, пока подключена зарядка |
 | `services/lowbattery` | `/userdata/system/services/` | Выключает приставку при низком заряде на батарее |
+| `services/chargevibe` | `/userdata/system/services/` | Коротко вибрирует при подключении зарядки |
 | `app/battery_app.py`, `app/Battery.sh` | `/userdata/roms/tools/` | Приложение Battery |
 
-Настройки хранятся в `/userdata/system/configs/battery-tools.conf`. Службы перечитывают файл на каждой проверке (раз в 30/60 с), поэтому изменения применяются без перезапуска.
+Настройки хранятся в `/userdata/system/configs/battery-tools.conf`. Службы перечитывают файл на каждой проверке, поэтому изменения применяются без перезапуска.
 
 ## Установка с Mac
 
@@ -19,7 +20,7 @@
 tools/battery/install.sh 192.168.2.173
 ```
 
-Установщик сохраняет существующие настройки, включает обе службы в автозапуск (`system.services` в `knulli.conf`) и добавляет Battery в `gamelist.xml` раздела «Инструменты». EmulationStation держит списки в памяти и записывает их обратно при перезагрузке, поэтому установщик сначала просит её сохранить списки (`/reloadgames` на порту 1234), затем правит файл и перезагружает списки ещё раз.
+Установщик сохраняет существующие настройки, включает все три службы в автозапуск (`system.services` в `knulli.conf`) и добавляет Battery в `gamelist.xml` раздела «Инструменты». EmulationStation держит списки в памяти и записывает их обратно при перезагрузке, поэтому установщик сначала просит её сохранить списки (`/reloadgames` на порту 1234), затем правит файл и перезагружает списки ещё раз.
 
 ## Приложение
 
@@ -31,6 +32,7 @@ tools/battery/install.sh 192.168.2.173
 - **Диапазон** — 40–60% (хранение, игра на ТВ с кабелем), 50–80% (повседневно), 20–80% (максимум циклов).
 - **Зарядить до 100% один раз** — перед поездкой. Действует до полного заряда или отключения кабеля, затем ограничение возвращается само.
 - **Выключение при низком заряде** — вкл/выкл, порог 10/15/20/25%.
+- **Вибрация при зарядке** — вкл/выкл.
 
 ## Утилита
 
@@ -40,6 +42,7 @@ battery-tools limit off       # on | off | toggle
 battery-tools range 50 80
 battery-tools full            # один раз до 100%
 battery-tools lowbat-percent 20
+battery-tools vibrate off     # on | off | toggle
 ```
 
 ## Как работает ограничение
@@ -50,12 +53,16 @@ battery-tools lowbat-percent 20
 - При заряде ≤ нижней границы зарядка снова разрешается.
 - Без кабеля, при выключенном ограничении и при остановке службы зарядка всегда разрешена.
 
+## Вибрация при подключении зарядки
+
+`chargevibe` раз в секунду читает `axp2202-usb/online` и при переходе 0 → 1 включает вибромотор на 0,3 с через `/sys/class/power_supply/axp2202-battery/moto` (тот же переключатель использует штатный `knulli-rumble`). Зарядка, подключённая уже при загрузке, не вызывает вибрации. Ограничение заряда тоже: пока `chargelimit` держит заряд, `online` остаётся 1. Если кабель болтается, вибрация повторяется не чаще раза в 5 с. Проверить мотор: `/userdata/system/services/chargevibe test`.
+
 Журналы: `/userdata/system/logs/chargelimit.log`, `/userdata/system/logs/lowbattery.log`.
 
 ## Удаление
 
 ```sh
-ssh root@192.168.2.173 'for s in chargelimit lowbattery; do knulli-services stop $s; knulli-services disable $s; rm /userdata/system/services/$s; done; rm -r /userdata/system/bin/battery-tools /userdata/system/configs/battery-tools.conf /userdata/system/configs/battery-app.conf /userdata/roms/tools/Battery.sh /userdata/roms/tools/battery /userdata/roms/tools/images/battery.png'
+ssh root@192.168.2.173 'for s in chargelimit lowbattery chargevibe; do knulli-services stop $s; knulli-services disable $s; rm /userdata/system/services/$s; done; rm -r /userdata/system/bin/battery-tools /userdata/system/configs/battery-tools.conf /userdata/system/configs/battery-app.conf /userdata/roms/tools/Battery.sh /userdata/roms/tools/battery /userdata/roms/tools/images/battery.png'
 ```
 
 Запись в `gamelist.xml` раздела «Инструменты» удаляется вручную; копия до установки — `gamelist.xml.bak-battery-20261027`.

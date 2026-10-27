@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """Battery app for the RG40XX H on Knulli (Tools section).
 
-Shows the battery state and switches the charge limit and the low-battery shutdown through
-battery-tools. Works on the handheld screen (640x480) and on a widescreen TV: the layout is
+Shows the battery state and switches the charge limit, the low-battery shutdown and the
+vibration on plugging in a charger through battery-tools. Works on the handheld screen (640x480) and on a widescreen TV: the layout is
 480 units high and its width follows the display, so text is never stretched. The interface is
 in English with a switch to Russian; the choice is kept in battery-app.conf.
 
@@ -51,13 +51,15 @@ TEXT = {
         "settings": "SETTINGS", "on": "ON", "off": "OFF", "language_name": "English",
         "limit": "Charge limit", "range": "Charge range", "full": "Charge to 100% once",
         "full_active": "ACTIVE", "full_press": "PRESS A", "lowbat": "Low-battery shutdown",
-        "percent": "Shutdown threshold", "language": "Language / Язык", "exit": "Exit",
+        "percent": "Shutdown threshold", "vibrate": "Vibrate on charger",
+        "language": "Language / Язык", "exit": "Exit",
         "storage": "storage", "everyday": "everyday", "cycles": "max cycles", "custom": "custom",
         "limit_toggled": "Charge limit switched", "range_set": "Range {low}–{high}%",
         "plug_in": "Plug in the charger, then try again",
         "full_set": "Charging to 100%, then the limit comes back",
         "lowbat_toggled": "Low-battery shutdown switched",
         "percent_set": "Shutdown threshold {value}%",
+        "vibrate_toggled": "Charger vibration switched",
         "voltage": "Voltage", "temperature": "Temperature", "health": "Health",
         "to_full": "Time to full", "to_empty": "Time left", "volts": "V",
         "hours": "{h} h {m:02d} min", "minutes": "{m} min",
@@ -75,6 +77,7 @@ TEXT = {
         "limit": "Ограничение заряда", "range": "Диапазон заряда",
         "full": "Зарядить до 100% один раз", "full_active": "ИДЁТ", "full_press": "НАЖМИТЕ A",
         "lowbat": "Выключение при низком заряде", "percent": "Порог выключения",
+        "vibrate": "Вибрация при зарядке",
         "language": "Language / Язык", "exit": "Выход",
         "storage": "хранение", "everyday": "повседневно", "cycles": "максимум циклов",
         "custom": "свой",
@@ -83,6 +86,7 @@ TEXT = {
         "full_set": "Зарядка до 100%, потом ограничение вернётся",
         "lowbat_toggled": "Выключение при низком заряде переключено",
         "percent_set": "Порог выключения {value}%",
+        "vibrate_toggled": "Вибрация при зарядке переключена",
         "voltage": "Напряжение", "temperature": "Температура", "health": "Состояние",
         "to_full": "До полного", "to_empty": "До разряда", "volts": "В",
         "hours": "{h} ч {m:02d} мин", "minutes": "{m} мин",
@@ -227,6 +231,7 @@ class BatteryApp:
         low, high = number(s, "low", 40), number(s, "high", 60)
         lowbat = s.get("lowbat_enabled") == "1"
         full = s.get("full_once") == "1"
+        vibrate = s.get("vibrate_enabled") == "1"
         range_name = t[RANGE_NAMES.get((low, high), "custom")]
         return [
             ("limit", t["limit"], t["on"] if limit else t["off"], GREEN if limit else MUTED),
@@ -235,6 +240,8 @@ class BatteryApp:
              YELLOW if full else MUTED),
             ("lowbat", t["lowbat"], t["on"] if lowbat else t["off"], GREEN if lowbat else MUTED),
             ("percent", t["percent"], f"◀ {number(s, 'lowbat_percent', 15)}% ▶", WHITE),
+            ("vibrate", t["vibrate"], t["on"] if vibrate else t["off"],
+             GREEN if vibrate else MUTED),
             ("language", t["language"], f"◀ {t['language_name']} ▶", CYAN),
             ("exit", t["exit"], "", WHITE),
         ]
@@ -269,6 +276,9 @@ class BatteryApp:
             value = THRESHOLDS[(index + (direction or 1)) % len(THRESHOLDS)]
             run_tool("lowbat-percent", str(value))
             self.notify(t["percent_set"].format(value=value))
+        elif key == "vibrate" and not direction:
+            run_tool("vibrate", "toggle")
+            self.notify(t["vibrate_toggled"])
         elif key == "language":
             index = LANGUAGES.index(self.language)
             self.language = LANGUAGES[(index + (direction or 1)) % len(LANGUAGES)]
@@ -378,14 +388,15 @@ class BatteryApp:
         self.rect(panel_x, 98, panel_w, 3, YELLOW)
         self.text(panel_x + 18, 110, t["settings"], WHITE, 17, True)
         for i, (_, label, value, color) in enumerate(self.items()):
-            top = 142 + i * 40
+            top = 140 + i * 35
             if i == self.selected:
-                self.rect(panel_x + 10, top - 5, panel_w - 20, 37, SELECTED, 6)
-                self.rect(panel_x + 10, top - 5, 4, 37, YELLOW, 2)
+                self.rect(panel_x + 10, top - 3, panel_w - 20, 33, SELECTED, 6)
+                self.rect(panel_x + 10, top - 3, 4, 33, YELLOW, 2)
             self.text(panel_x + 24, top, label, YELLOW if i == self.selected else WHITE, 14)
             if value:
                 self.text(panel_x + panel_w - 22, top + 15, value, color, 12, True, "right")
-        services = s.get("chargelimit_service") == "1" and s.get("lowbattery_service") == "1"
+        services = all(s.get(f"{name}_service") == "1"
+                       for name in ("chargelimit", "lowbattery", "chargevibe"))
         if not services:
             self.text(panel_x + 18, 424, t["services_off"], RED, 10)
         # Footer and notice.

@@ -1,0 +1,82 @@
+#!/bin/bash
+# Buzz the vibration motor once when a charger is plugged in, so it is clear the cable works
+# even with the screen off. Only the moment of plugging in counts: a charger already connected
+# at boot or when the service starts gives no buzz. Settings:
+# /userdata/system/configs/battery-tools.conf, read on every plug-in (see battery-tools).
+#
+# The charger state is axp2202-usb/online; it stays 1 while chargelimit blocks charging, so the
+# charge limit never causes a buzz. The motor is the same sysfs switch knulli-rumble uses.
+USB=/sys/class/power_supply/axp2202-usb
+MOTOR=/sys/class/power_supply/axp2202-battery/moto
+CONF=/userdata/system/configs/battery-tools.conf
+PIDFILE=/var/run/chargevibe.pid
+INTERVAL=1
+BUZZ=0.3
+# A loose cable can flicker; one buzz per this many seconds at most.
+QUIET=5
+
+load_settings() {
+    VIBRATE_ON_CHARGE=1
+    # shellcheck source=/dev/null
+    [ -f "$CONF" ] && . "$CONF"
+}
+
+buzz() {
+    echo 1 >"$MOTOR" && sleep "$BUZZ"
+    echo 0 >"$MOTOR"
+}
+
+watch_charger() {
+    trap 'echo 0 >"$MOTOR"; exit 0' TERM INT
+    local plugged last=0 buzzed=-$QUIET
+    read -r last <"$USB/online" 2>/dev/null
+    while true; do
+        plugged=0
+        read -r plugged <"$USB/online" 2>/dev/null
+        if [ "$plugged" = 1 ] && [ "$last" != 1 ] && [ $((SECONDS - buzzed)) -ge $QUIET ]; then
+            load_settings
+            if [ "$VIBRATE_ON_CHARGE" = 1 ]; then
+                buzz
+                buzzed=$SECONDS
+            fi
+        fi
+        last=$plugged
+        sleep "$INTERVAL" &
+        wait $!
+    done
+}
+
+case "$1" in
+    start)
+        echo -n "Starting charger vibration: "
+        if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+            echo "already running"
+            exit 0
+        fi
+        watch_charger </dev/null >/dev/null 2>&1 &
+        echo $! >"$PIDFILE"
+        echo "done"
+        ;;
+    stop)
+        if [ -f "$PIDFILE" ]; then
+            kill "$(cat "$PIDFILE")" 2>/dev/null
+            rm -f "$PIDFILE"
+        fi
+        ;;
+    status)
+        load_settings
+        if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+            echo "running, $([ "$VIBRATE_ON_CHARGE" = 1 ] && echo on || echo off)," \
+                "charger online=$(cat "$USB/online")"
+        else
+            echo "stopped"
+        fi
+        ;;
+    test)
+        buzz
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|status|test}"
+        ;;
+esac
+exit 0
